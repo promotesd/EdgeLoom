@@ -7,6 +7,8 @@ Train AIA-UNet (ldm) + Dual ControlNet branches with Accelerate.
 - 数据集两列条件图: --conditioning_image_column (edge/hint) + --ref_image_column (ref/semantics)
 """
 
+
+
 import argparse
 import contextlib
 import gc
@@ -45,6 +47,15 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 
 from edgeloom.models.contourforge.aia_2controlnet import ControlAIA_System
+from diffusers.training_utils import compute_snr
+
+
+# import os
+# if os.environ.get("LOCAL_RANK", "0") == "0":
+#     import debugpy
+#     debugpy.listen(("0.0.0.0", 5678))
+#     print("⏳ Waiting for VS Code to attach on port 5678…")
+#     debugpy.wait_for_client()
 
 if is_wandb_available():
     import wandb
@@ -76,7 +87,7 @@ def parse_args(input_args=None):
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--lr_scheduler", type=str, default="constant",
                         choices=["linear","cosine","cosine_with_restarts","polynomial","constant","constant_with_warmup"])
     parser.add_argument("--lr_warmup_steps", type=int, default=500)
@@ -114,7 +125,7 @@ def parse_args(input_args=None):
     parser.add_argument("--proportion_empty_prompts", type=float, default=0)
 
     # AIA-UNet 冻结/微调策略
-    parser.add_argument("--aia_freeze_in", action="store_true", default=True)
+    parser.add_argument("--aia_freeze_in", action="store_true", default=False)
     parser.add_argument("--aia_freeze_mid", action="store_true", default=False)
     parser.add_argument("--aia_freeze_out", action="store_true", default=False)
 
@@ -339,6 +350,18 @@ def main(args):
     latent_size = args.resolution // 8
     unet_cfg, control_cfg, ssl_cfg = build_default_configs(latent_size, context_dim=768)
 
+
+    # ★ 关键：让 _BaseControl/UNet 内部 self.dtype 与训练精度一致
+    if accelerator.mixed_precision == "fp16":
+        unet_cfg["params"]["use_fp16"] = True
+        control_cfg["params"]["use_fp16"] = True
+        ssl_cfg["params"]["use_fp16"] = True
+    else:
+        # bf16/无混合精度就不要打开 use_fp16（模型里只有这个开关，别误开）
+        unet_cfg["params"]["use_fp16"] = False
+        control_cfg["params"]["use_fp16"] = False
+        ssl_cfg["params"]["use_fp16"] = False
+
     model = ControlAIA_System(
         unet_config=unet_cfg,
         control_stage_config=control_cfg,
@@ -349,11 +372,30 @@ def main(args):
         learning_rate=args.learning_rate,
     )
 
+    def warmstart_control_from_unet(control_module, unet_module):
+        cn_sd = control_module.state_dict()
+        un_sd = unet_module.state_dict()
+        copied = 0
+        for k in list(cn_sd.keys()):
+            # 只拷 input_blocks 和 middle_block 的匹配权重
+            if (k.startswith("input_blocks.") or k.startswith("middle_block.")) and k in un_sd:
+                if cn_sd[k].shape == un_sd[k].shape:
+                    cn_sd[k] = un_sd[k]
+                    copied += 1
+        control_module.load_state_dict(cn_sd, strict=False)
+        print(f"[warmstart] copied {copied} tensors from UNet -> ControlNet")
+
+
+
     # （可选）载入 AIA-UNet 预训练权重（建议提供）
     if args.ldm_unet_ckpt is not None and os.path.isfile(args.ldm_unet_ckpt):
         sd = torch.load(args.ldm_unet_ckpt, map_location="cpu")
         missing, unexpected = model.unet.load_state_dict(sd, strict=False)
         logger.info(f"Loaded AIA-UNet ckpt: missing={len(missing)}, unexpected={len(unexpected)}")
+
+        # 调用
+    warmstart_control_from_unet(model.control_model, model.unet)
+    warmstart_control_from_unet(model.ssl_stage_model, model.unet)
 
     # xformers（若你的 AIA-UNet/ControlNet 内部支持，则可启用；否则可以忽略）
     if args.enable_xformers_memory_efficient_attention:
@@ -420,6 +462,8 @@ def main(args):
         model, optimizer, train_dataloader, lr_scheduler
     )
 
+
+
     # dtype / 设备
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -434,6 +478,8 @@ def main(args):
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    else:
+        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -466,8 +512,10 @@ def main(args):
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=initial_global_step,
-                        desc="Steps", disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(0, args.max_train_steps),
+                    initial=initial_global_step,
+                    desc="Steps",
+                    disable=not accelerator.is_local_main_process)
 
     # -------------------------
     # Training Loop
@@ -510,7 +558,15 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                # loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                mse = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                mse = mse.mean(dim=list(range(1, mse.ndim)))  # per-sample
+
+                snr = compute_snr(noise_scheduler, timesteps)
+                gamma = 5.0  # 可调 3~7
+                # 对 epsilon 预测的常用配方（简化写法）：
+                weights = torch.minimum(snr, torch.full_like(snr, gamma)) / (snr + 1)
+                loss = (weights * mse).mean()
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -546,6 +602,8 @@ def main(args):
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
+                break
+        if global_step >= args.max_train_steps:
                 break
 
     # Final save

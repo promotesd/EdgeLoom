@@ -9,7 +9,7 @@ cd "$PROJECT_ROOT"
 
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
-CUDA_VISIBLE_DEVICES=0,1
+CUDA_VISIBLE_DEVICES=0
 
 accelerate launch -m edgeloom.train.train_controlnet \
   --pretrained_model_name_or_path $MODEL_DIR \

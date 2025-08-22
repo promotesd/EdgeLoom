@@ -1,212 +1,363 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-
-
+Inference for AIA-UNet + Dual ControlNet (no target image).
 """
 
-import argparse, os, gc, sys, math
+import argparse
+import json
+import os
 from pathlib import Path
+from typing import Dict, List, Optional
 
+import contextlib
+import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
-from tqdm.auto import tqdm
-from torchvision import transforms as T
+from torchvision import transforms
+from transformers import AutoTokenizer, PretrainedConfig
 
-from transformers import AutoTokenizer, CLIPTextModel
-from diffusers import (
-    AutoencoderKL,
-    UNet2DConditionModel,
-    ControlNetModel,
-    UniPCMultistepScheduler,
-)
+from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.utils.import_utils import is_xformers_available
 
-# ------------------------------------------------------------
-def build_cond_transform(res: int):
-    """与训练脚本相同：Resize → CenterCrop → ToTensor()"""
-    return T.Compose([
-        T.Resize(res, interpolation=T.InterpolationMode.BILINEAR),
-        T.CenterCrop(res),
-        T.ToTensor(),    # 0-1 float
-    ])
+# 你训练时的实现
+from edgeloom.models.contourforge.aia_2controlnet import ControlAIA_System
 
-def set_peft_scale(model, scale: float):
-    """兼容 PEFT ≥0.6；若接口不存在则手动写 scaling"""
-    if hasattr(model, "set_scale"):
-        model.set_scale(scale)
+
+# --------- 和训练时一致的结构构建（默认 SD1.x 配置） ---------
+def build_default_configs(latent_size: int, context_dim: int = 768):
+    unet_config = {
+        "target": "edgeloom.models.contourforge.aia_2controlnet.ControlledUnetModel",
+        "params": {
+            "image_size": latent_size,
+            "in_channels": 4,
+            "out_channels": 4,
+            "model_channels": 320,
+            "num_res_blocks": 2,
+            "attention_resolutions": [4, 2, 1],
+            "channel_mult": [1, 2, 4, 4],
+            "conv_resample": True,
+            "use_spatial_transformer": True,
+            "transformer_depth": 1,
+            "context_dim": context_dim,
+            "num_head_channels": 64,
+            "legacy": False,
+        },
+    }
+    base_cn_params = {
+        "image_size": latent_size,
+        "in_channels": 4,
+        "model_channels": 320,
+        "hint_channels": 3,
+        "num_res_blocks": 2,
+        "attention_resolutions": [4, 2, 1],
+        "channel_mult": [1, 2, 4, 4],
+        "use_spatial_transformer": True,
+        "transformer_depth": 1,
+        "context_dim": context_dim,
+        "num_head_channels": 64,
+        "legacy": False,
+    }
+    control_stage_config = {
+        "target": "edgeloom.models.contourforge.aia_2controlnet.ControlNet",
+        "params": base_cn_params,
+    }
+    ssl_stage_config = {
+        "target": "edgeloom.models.contourforge.aia_2controlnet.ControlNet_latent",
+        "params": base_cn_params,
+    }
+    return unet_config, control_stage_config, ssl_stage_config
+
+
+# --------- 文本编码器类选择（和训练保持一致） ---------
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: Optional[str] = None):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder="text_encoder", revision=revision
+    )
+    arch = text_encoder_config.architectures[0]
+    if arch == "CLIPTextModel":
+        from transformers import CLIPTextModel
+        return CLIPTextModel
+    elif arch == "RobertaSeriesModelWithTransformation":
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+        return RobertaSeriesModelWithTransformation
     else:
-        for m in model.modules():
-            if hasattr(m, "scaling"):
-                m.scaling = scale
+        raise ValueError(f"{arch} is not supported.")
 
-# ------------------------------------------------------------
-def parse_args():
-    ap = argparse.ArgumentParser()
-    # 基础路径
-    ap.add_argument("--base_model", required=True,
-                    help="Stable-Diffusion-1.5 权重目录或 huggingface 名称")
-    ap.add_argument("--controlnet_path", required=True,
-                    help="训练好的 ControlNet 目录（含 safetensors 或 Diffusers 格式）")
-    ap.add_argument("--lora_path", default=None,
-                    help="如需再套一层 LoRA adapter（可选）")
-    ap.add_argument("--lora_scale", type=float, default=1.0)
 
-    # 数据与输出
-    ap.add_argument("--source_dir", required=True,
-                    help="存放条件图像 (source/edge) 的文件夹")
-    ap.add_argument("--prompt", required=True)
-    ap.add_argument("--negative_prompt", default="")
-    ap.add_argument("--output_dir", default="infer_out")
-    ap.add_argument("--save_images", dest="save_images",
-                    action="store_true", default=True)   # --no-save_images 可关闭
-    ap.add_argument("--no-save_images", dest="save_images",
-                    action="store_false")
+# --------- 预处理 ---------
+def make_transforms(res: int):
+    cond_ref_tf = transforms.Compose([
+        transforms.Resize(res, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(res),
+        transforms.ToTensor(),  # [0,1]
+    ])
+    return cond_ref_tf
 
-    # 推理超参
-    ap.add_argument("--resolution", type=int, default=512)
-    ap.add_argument("--steps", type=int, default=30)
-    ap.add_argument("--guidance_scale", type=float, default=7.5)
-    ap.add_argument("--conditioning_scale", type=float, default=1.0)
-    ap.add_argument("--batch_size", type=int, default=1)
+def load_image(path: str, tf):
+    img = Image.open(path).convert("RGB")
+    return tf(img)  # (3,H,W), float[0,1]
 
-    # 运行环境
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--xformers", action="store_true")
 
-    return ap.parse_args()
-
-# ------------------------------------------------------------
+# --------- 采样循环（DDIM + CFG） ---------
 @torch.no_grad()
+def sample_images(
+    model: ControlAIA_System,
+    vae: AutoencoderKL,
+    tokenizer,
+    text_encoder,
+    scheduler: DDIMScheduler,
+    records: List[Dict],
+    out_dir: Path,
+    resolution: int,
+    num_inference_steps: int = 30,
+    guidance_scale: float = 7.5,
+    control_scale: float = 1.0,
+    num_images_per_prompt: int = 1,
+    seed: Optional[int] = None,
+    guess_mode: bool = False,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.float32,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tf = make_transforms(resolution)
+
+    # autocast 上下文（仅在 CUDA 且半精度时启用）
+    amp = (dtype in (torch.float16, torch.bfloat16)) and (device.type == "cuda")
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=dtype) if amp else contextlib.nullcontext()
+
+    # 控制强度
+    model.set_control_scales_uniform(control_scale)
+    model.eval()
+
+    # 文本编码：保持 fp32，更稳；最后外面再 .to(dtype)
+    def encode_text(prompts: List[str]):
+        tokens = tokenizer(
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
+        )
+        z = text_encoder(tokens.input_ids.to(device))[0]  # fp32
+        return z
+
+    # 噪声调度器
+    scheduler.set_timesteps(num_inference_steps, device=device)
+
+    gen = torch.Generator(device=device)
+    if seed is not None:
+        gen.manual_seed(seed)
+
+    for idx, rec in enumerate(records):
+        cond_path = rec["source"]
+        ref_path  = rec["ref_image"]
+        prompt    = rec.get("prompt", "")
+
+        cond = load_image(cond_path, tf).unsqueeze(0).to(device=device, dtype=dtype)  # (1,3,H,W)
+        ref  = load_image(ref_path,  tf).unsqueeze(0).to(device=device, dtype=dtype)
+
+        # 文本（编码时 fp32，随后转目标 dtype）
+        cond_text = encode_text([prompt]).to(dtype)
+
+        for k in range(num_images_per_prompt):
+            latents = torch.randn(
+                (1, 4, resolution // 8, resolution // 8),
+                generator=gen, device=device, dtype=dtype,
+            )
+            latents = latents * scheduler.init_noise_sigma
+
+            for t in scheduler.timesteps:
+                t_tensor = torch.tensor([t], device=device)
+
+                with autocast_ctx:
+                    if guess_mode:
+                        eps_uncond = model(
+                            noisy_latents=latents,
+                            timesteps=t_tensor,
+                            hint=torch.zeros_like(cond),
+                            ssl_hint=torch.zeros_like(ref),
+                        )
+                    else:
+                        eps_uncond = model(
+                            noisy_latents=latents,
+                            timesteps=t_tensor,
+                            hint=cond,
+                            ssl_hint=ref,
+                        )
+
+                    eps_text = model(
+                        noisy_latents=latents,
+                        timesteps=t_tensor,
+                        encoder_hidden_states=cond_text,
+                        hint=cond,
+                        ssl_hint=ref,
+                    )
+
+                eps = eps_text
+                latents = scheduler.step(eps, t, latents).prev_sample
+
+            imgs = vae.decode(latents / vae.config.scaling_factor).sample
+            imgs = (imgs / 2 + 0.5).clamp(0, 1)
+            img = imgs[0].permute(1, 2, 0).cpu().numpy()
+            img = (img * 255).round().astype(np.uint8)
+            pil = Image.fromarray(img)
+
+            base = rec.get("out", None)
+            if not base:
+                base = f"{Path(cond_path).stem}.png"
+            save_path = out_dir / base
+            pil.save(save_path)
+            print(f"[{idx:04d}/{len(records)}] saved => {save_path}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser("AIA + Dual ControlNet Inference (no target)")
+    # base sd
+    p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    p.add_argument("--revision", type=str, default=None)
+
+    # weights
+    p.add_argument("--aia_unet_ckpt", type=str, required=True)
+    p.add_argument("--control_edge_ckpt", type=str, required=True)
+    p.add_argument("--control_ref_ckpt", type=str, required=True)
+
+    # I/O
+    p.add_argument("--output_dir", type=str, default="./outputs")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--jsonl", type=str, help="JSONL with: source, ref_image")
+    group.add_argument("--conditioning_image", type=str, help="single edge/hint image path")
+    p.add_argument("--ref_image", type=str, help="single ref/semantic image path (required with --conditioning_image)")
+    p.add_argument("--prompt", type=str, default="", help="single prompt")
+    p.add_argument("--negative_prompt", type=str, default="", help="negative prompt")
+
+    # sampling
+    p.add_argument("--resolution", type=int, default=512)
+    p.add_argument("--num_inference_steps", type=int, default=30)
+    p.add_argument("--guidance_scale", type=float, default=5.5)
+    p.add_argument("--control_scale", type=float, default=1.0)
+    p.add_argument("--num_images_per_prompt", type=int, default=1)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--guess_mode", action="store_true", help="uncond branch uses zero control")
+    p.add_argument("--precision", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
+
+    return p.parse_args()
+
+
 def main():
     args = parse_args()
-    if args.save_images:
-        os.makedirs(args.output_dir, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- 0. 环境 ----------
-    torch_dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
-    device = torch.device(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.precision == "fp16":
+        dtype = torch.float16
+    elif args.precision == "bf16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
 
-    # ---------- 1. 加载各模块 ----------
-    tk      = AutoTokenizer.from_pretrained(Path(args.base_model)/"tokenizer", use_fast=False)
-    txt_enc = CLIPTextModel.from_pretrained(Path(args.base_model)/"text_encoder",
-                                            torch_dtype=torch_dtype)
-    vae     = AutoencoderKL.from_pretrained(Path(args.base_model)/"vae",
-                                            torch_dtype=torch_dtype)
-    unet    = UNet2DConditionModel.from_pretrained(Path(args.base_model)/"unet",
-                                                   torch_dtype=torch_dtype)
-    cnet    = ControlNetModel.from_pretrained(args.controlnet_path,
-                                              torch_dtype=torch_dtype)
+    # Base SD components
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False, revision=args.revision
+    )
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+    # 文本编码器固定 fp32
+    text_encoder = text_encoder_cls.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    ).to(device=device, dtype=torch.float32).eval()
 
-    # ---- LoRA (可选) ----
-    if args.lora_path:
-        from peft import PeftModel
-        cnet = PeftModel.from_pretrained(cnet, args.lora_path)
-        set_peft_scale(cnet, args.lora_scale)
-        print(f"✅ Loaded LoRA: {args.lora_path}, scale={args.lora_scale}")
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+    ).to(device=device, dtype=dtype).eval()
 
-    # ---- xFormers ----
-    if args.xformers and is_xformers_available():
-        unet.enable_xformers_memory_efficient_attention()
-        if hasattr(cnet, "enable_xformers_memory_efficient_attention"):
-            cnet.enable_xformers_memory_efficient_attention()
+    scheduler = DDIMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler", revision=args.revision
+    )
 
-    # ---- device ----
-    for m in (txt_enc, vae, unet, cnet):
-        m.to(device)
+    # Build AIA + dual control system（结构需与训练一致）
+    latent_h, latent_w = args.resolution // 8, args.resolution // 8
+    unet_cfg, control_cfg, ssl_cfg = build_default_configs(latent_size=args.resolution // 8, context_dim=768)
 
-    # ---- scheduler ----
-    scheduler = UniPCMultistepScheduler.from_pretrained(args.base_model, subfolder="scheduler")
-    scheduler.set_timesteps(args.steps, device=device)
+    # 关键：若使用 fp16 推理，则把 config 里的 use_fp16 打开，让模块内部 self.dtype=fp16
+    if dtype == torch.float16:
+        unet_cfg["params"]["use_fp16"] = True
+        control_cfg["params"]["use_fp16"] = True
+        ssl_cfg["params"]["use_fp16"] = True
 
-    # ---------- 2. 文本嵌入 ----------
-    def encode(text):
-        ids = tk(text,
-                 padding="max_length",
-                 max_length=tk.model_max_length,
-                 truncation=True,
-                 return_tensors="pt").input_ids.to(device)
-        return txt_enc(ids)[0]
+    model = ControlAIA_System(
+        unet_config=unet_cfg,
+        control_stage_config=control_cfg,
+        ssl_stage_config=ssl_cfg,
+        freeze_unet_in=True,
+        freeze_unet_mid=True,
+        freeze_unet_out=True,
+        learning_rate=1e-4,
+    ).to(device=device, dtype=dtype).eval()
 
-    pos_embed = encode(args.prompt)
-    neg_embed = encode(args.negative_prompt)
+    # Load weights（建议 weights_only=True）
+    sd_unet = torch.load(args.aia_unet_ckpt, map_location="cpu", weights_only=True)
+    missing, unexpected = model.unet.load_state_dict(sd_unet, strict=False)
+    print(f"[load] AIA-UNet: missing={len(missing)}, unexpected={len(unexpected)}")
 
-    # ---------- 3. 读入条件图 ----------
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-    cond_paths = sorted(p for p in Path(args.source_dir).rglob("*") if p.suffix.lower() in exts)
-    if not cond_paths:
-        sys.exit(f"No images found in {args.source_dir}")
+    sd_edge = torch.load(args.control_edge_ckpt, map_location="cpu", weights_only=True)
+    model.control_model.load_state_dict(sd_edge, strict=False)
 
-    tfm_cond = build_cond_transform(args.resolution)
+    sd_ref = torch.load(args.control_ref_ckpt, map_location="cpu", weights_only=True)
+    model.ssl_stage_model.load_state_dict(sd_ref, strict=False)
 
-    # ---------- 4. 随机种子 ----------
-    g = torch.Generator(device=device).manual_seed(args.seed) if args.seed else None
+    # Try xFormers if available (可选)
+    if is_xformers_available():
+        try:
+            model.unet.enable_xformers_memory_efficient_attention()
+            model.control_model.enable_xformers_memory_efficient_attention()
+            model.ssl_stage_model.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
 
-    # ---------- 5. 推理循环 ----------
-    for path in tqdm(cond_paths, desc="Inference"):
-        cond = tfm_cond(Image.open(path).convert("RGB")).unsqueeze(0).to(device, dtype=torch_dtype)
-        cond = cond.repeat(args.batch_size, 1, 1, 1)      # (B,3,H,W)
-        B     = args.batch_size
-        H, W  = args.resolution, args.resolution
+    # Build records
+    records: List[Dict] = []
+    if args.jsonl:
+        with open(args.jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                x = json.loads(line.strip())
+                if ("source" not in x) or ("ref_image" not in x):
+                    raise ValueError("Each JSONL line must contain fields: 'source' and 'ref_image'")
+                if "prompt" not in x:
+                    x["prompt"] = ""
+                records.append(x)
+    else:
+        if not args.conditioning_image or not args.ref_image:
+            raise ValueError("Single image mode requires --conditioning_image and --ref_image")
+        records = [{
+            "source": args.conditioning_image,
+            "ref_image": args.ref_image,
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "out": None,
+        }]
 
-        # Step-0 latent
-        latents = torch.randn(B, unet.in_channels, H//8, W//8, generator=g,
-                              device=device, dtype=torch_dtype)
-        latents = latents * scheduler.init_noise_sigma
+    # Run
+    sample_images(
+        model=model,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scheduler=scheduler,
+        records=records,
+        out_dir=out_dir,
+        resolution=args.resolution,
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        control_scale=args.control_scale,
+        num_images_per_prompt=args.num_images_per_prompt,
+        negative_prompt_default=args.negative_prompt,
+        seed=args.seed,
+        guess_mode=args.guess_mode,
+        device=device,
+        dtype=dtype,
+    )
 
-        scheduler.set_timesteps(args.steps, device=device)
-        timesteps = scheduler.timesteps
 
-        # 批量扩增 CFG
-        pos_emb = pos_embed.repeat(B, 1, 1)
-        neg_emb = neg_embed.repeat(B, 1, 1)
-
-        for t in timesteps:
-            # (2B,4,64,64)
-            latent_model_input = torch.cat([latents] * 2, dim=0)
-            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-
-            # ---- ControlNet 前向 ----
-            down_s, mid_s = cnet(
-                latent_model_input,
-                t,
-                encoder_hidden_states=torch.cat([neg_emb, pos_emb], 0),
-                controlnet_cond=cond.repeat(2,1,1,1),
-                conditioning_scale=args.conditioning_scale,
-                return_dict=False
-            )
-
-            # ---- UNet 前向 ----
-            noise_pred = unet(
-                latent_model_input,
-                t,
-                encoder_hidden_states=torch.cat([neg_emb, pos_emb], 0),
-                down_block_additional_residuals=[d.to(latent_model_input.dtype) for d in down_s],
-                mid_block_additional_residual=mid_s.to(latent_model_input.dtype),
-                return_dict=False
-            )[0]
-
-            # ---- CFG ----
-            eps_uncond, eps_text = noise_pred.chunk(2)
-            eps = eps_uncond + args.guidance_scale * (eps_text - eps_uncond)
-
-            # ---- Scheduler step ----
-            latents = scheduler.step(eps, t, latents).prev_sample
-
-        # ---- VAE decode ----
-        imgs = vae.decode(latents / vae.config.scaling_factor).sample
-        imgs = (imgs.clamp(-1,1) + 1) / 2.0         # 0-1
-        imgs = imgs.mul(255).byte().permute(0,2,3,1).cpu().numpy()
-
-        if args.save_images:
-            for i, arr in enumerate(imgs):
-                fn = f"{path.stem}_{i}.png" if B > 1 else f"{path.stem}.png"
-                Image.fromarray(arr).save(Path(args.output_dir)/fn)
-
-        gc.collect(); torch.cuda.empty_cache()
-
-# ------------------------------------------------------------
 if __name__ == "__main__":
     main()
