@@ -21,14 +21,15 @@ accelerate launch -m edgeloom.train.train_controlnet \
   --ref_image_column ref_image \
   --resolution 512 \
   --max_train_steps 96000 \
-  --learning_rate 5e-5 \
+  --learning_rate 5e-6 \
   --train_batch_size 4 \
   --gradient_accumulation_steps 1 \
   --dataloader_num_workers 4  \
   --gradient_checkpointing \
   --use_8bit_adam \
   --checkpointing_steps 8000 \
-  --checkpoints_total_limit 5 
+  --checkpoints_total_limit 5 \
+  --ldm_unet_ckpt "/root/autodl-tmp/model/stable_diffusion-v1-5/unet/diffusion_pytorch_model.non_ema.safetensors"
 
 
   # --resume_from_checkpoint latest

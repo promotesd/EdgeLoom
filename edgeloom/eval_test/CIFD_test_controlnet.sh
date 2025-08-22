@@ -22,12 +22,12 @@ CUDA_VISIBLE_DEVICES=0
 
 python /root/autodl-tmp/code/CIFD_controlnet/EdgeLoom/edgeloom/eval_test/CIFD_test_controlnet.py \
   --pretrained_model_name_or_path /root/autodl-tmp/model/stable_diffusion-v1-5 \
-  --aia_unet_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-80000/aia_unet.pth \
-  --control_edge_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-80000/control_edge.pth \
-  --control_ref_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-80000/control_ref.pth \
+  --aia_unet_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-96000/aia_unet.pth \
+  --control_edge_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-96000/control_edge.pth \
+  --control_ref_ckpt /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/model_weight/checkpoint-96000/control_ref.pth \
   --jsonl /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/train.jsonl \
   --output_dir /root/autodl-tmp/dataset/CIFD_Ablation_Experiment/EdgeLoom/v1/phase2/train/generate_train \
   --resolution 512  \
-  --num_inference_steps 50 \
+  --num_inference_steps 200 \
   --control_scale 1.0 \
   --seed 42

@@ -2,16 +2,12 @@
 # coding=utf-8
 """
 Train AIA-UNet (ldm) + Dual ControlNet branches with Accelerate.
-- 依赖: edgeloom/models/aia_control_unet.py (ControlledUnetModel, ControlNet, ControlNet_latent, ControlAIA_System)
-- 使用 diffusers 的 VAE / 文本编码器 / 噪声调度器
-- 数据集两列条件图: --conditioning_image_column (edge/hint) + --ref_image_column (ref/semantics)
+  1) 从 SD1.5 原版 .ckpt/.safetensors 加载 model.diffusion_model.* 到 ControlledUnetModel
+  2) 冻结整张 U-Net（默认 True），只训练两条 ControlNet
+
 """
 
-
-
 import argparse
-import contextlib
-import gc
 import logging
 import math
 import os
@@ -19,43 +15,25 @@ import random
 import shutil
 from pathlib import Path
 
-import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
-import transformers
+from PIL import Image
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from packaging import version
-from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
 import diffusers
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-)
+from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.torch_utils import is_compiled_module
-
-
-from edgeloom.models.contourforge.aia_2controlnet import ControlAIA_System
+from diffusers.utils import is_wandb_available, is_xformers_available
 from diffusers.training_utils import compute_snr
 
-
-# import os
-# if os.environ.get("LOCAL_RANK", "0") == "0":
-#     import debugpy
-#     debugpy.listen(("0.0.0.0", 5678))
-#     print("⏳ Waiting for VS Code to attach on port 5678…")
-#     debugpy.wait_for_client()
+from edgeloom.models.contourforge.aia_2controlnet import ControlAIA_System
 
 if is_wandb_available():
     import wandb
@@ -69,11 +47,16 @@ logger = get_logger(__name__)
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Train AIA-UNet + Dual ControlNet")
 
-    # 预训练SD路径（用来加载 VAE / 文本编码器 / 调度器）
+    # 预训练 SD（VAE/文本编码器/调度器）
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
 
-    # （可选）AIA-UNet初始权重（ldm风格state_dict），若不提供则从随机初始化开始（通常不建议）
-    parser.add_argument("--ldm_unet_ckpt", type=str, default=None, help="Path to AIA-UNet (ldm) checkpoint (state_dict).")
+    # ★ SD1.5 的 ckpt/safetensors，用于灌入 U-Net（强制要求）
+    parser.add_argument(
+        "--ldm_unet_ckpt",
+        type=str,
+        required=True,
+        help="Path to SD1.5 checkpoint (.ckpt/.pth/.pt) or .safetensors containing model.diffusion_model.*",
+    )
 
     # 输出与缓存
     parser.add_argument("--output_dir", type=str, default="aia_dual_control_out")
@@ -87,9 +70,13 @@ def parse_args(input_args=None):
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--lr_scheduler", type=str, default="constant",
-                        choices=["linear","cosine","cosine_with_restarts","polynomial","constant","constant_with_warmup"])
+    parser.add_argument("--learning_rate", type=float, default=5e-6)  # 只训 Control，建议 5e-6 ~ 1e-5
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+    )
     parser.add_argument("--lr_warmup_steps", type=int, default=500)
     parser.add_argument("--lr_num_cycles", type=int, default=1)
     parser.add_argument("--lr_power", type=float, default=1.0)
@@ -104,7 +91,7 @@ def parse_args(input_args=None):
     # mixed precision & logging
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--report_to", type=str, default="tensorboard")
-    parser.add_argument("--mixed_precision", type=str, default=None, choices=["no","fp16","bf16"])
+    parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"])
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--checkpointing_steps", type=int, default=8000)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
@@ -120,14 +107,14 @@ def parse_args(input_args=None):
     parser.add_argument("--image_column", type=str, default="target")
     parser.add_argument("--caption_column", type=str, default="prompt")
     parser.add_argument("--conditioning_image_column", type=str, default="source")  # 边缘/引导
-    parser.add_argument("--ref_image_column", type=str, default="ref_image")                    # 参考/语义
+    parser.add_argument("--ref_image_column", type=str, default="ref_image")        # 参考/语义
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--proportion_empty_prompts", type=float, default=0)
 
-    # AIA-UNet 冻结/微调策略
-    parser.add_argument("--aia_freeze_in", action="store_true", default=False)
-    parser.add_argument("--aia_freeze_mid", action="store_true", default=False)
-    parser.add_argument("--aia_freeze_out", action="store_true", default=False)
+    # 冻结策略（默认全 True，只训练 ControlNet）
+    parser.add_argument("--aia_freeze_in", action="store_true", default=True)
+    parser.add_argument("--aia_freeze_mid", action="store_true", default=True)
+    parser.add_argument("--aia_freeze_out", action="store_true", default=True)
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -136,9 +123,10 @@ def parse_args(input_args=None):
 
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
-
     if args.resolution % 8 != 0:
         raise ValueError("`--resolution` must be divisible by 8")
+    if not os.path.isfile(args.ldm_unet_ckpt):
+        raise FileNotFoundError(f"--ldm_unet_ckpt not found: {args.ldm_unet_ckpt}")
 
     return args
 
@@ -151,16 +139,17 @@ def make_train_dataset(args, tokenizer, accelerator):
         if args.dataset_name.endswith(".jsonl") or args.dataset_name.endswith(".json"):
             dataset = load_dataset("json", data_files={"train": args.dataset_name}, cache_dir=args.cache_dir)
         else:
-            dataset = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir)
+            dataset = load_dataset(
+                args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir
+            )
     else:
         dataset = load_dataset(args.train_data_dir, cache_dir=args.cache_dir)
 
     column_names = dataset["train"].column_names
 
-    def get_col(name, default_pick=0):
+    def get_col(name):
         if name in column_names:
             return name
-        # 兜底：给出更友好的报错
         raise ValueError(f"Column `{name}` not found. Available: {', '.join(column_names)}")
 
     image_column = get_col(args.image_column)
@@ -184,23 +173,25 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
         return inputs.input_ids
 
-    # 注意：像 SD 的 ControlNet 习惯，target 图片 Normalize[-1,1]；control/ref 不做归一化到[-1,1]
-    image_transforms = transforms.Compose([
-        transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args.resolution),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
-    cond_transforms = transforms.Compose([
-        transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args.resolution),
-        transforms.ToTensor(),   # 不做 Normalize
-    ])
+    # target Normalize 到 [-1,1]；control/ref 不做 Normalize
+    image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+    cond_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+        ]
+    )
 
     def preprocess_train(examples):
-        images = []
-        cond_images = []
-        ref_images = []
+        images, cond_images, ref_images = [], [], []
         for p in examples[image_column]:
             img = Image.open(p).convert("RGB")
             images.append(image_transforms(img))
@@ -218,7 +209,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         examples["input_ids"] = input_ids
         return examples
 
-    with accelerator.main_process_first():
+    with Accelerator().main_process_first():  # just for safety if called outside
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         train_dataset = dataset["train"].with_transform(preprocess_train)
@@ -229,12 +220,12 @@ def make_train_dataset(args, tokenizer, accelerator):
 def collate_fn(examples):
     pixel_values = torch.stack([ex["pixel_values"] for ex in examples]).contiguous().float()
     cond_values = torch.stack([ex["conditioning_pixel_values"] for ex in examples]).contiguous().float()
-    ref_values  = torch.stack([ex["ref_pixel_values"] for ex in examples]).contiguous().float()
-    input_ids   = torch.stack([ex["input_ids"] for ex in examples])
+    ref_values = torch.stack([ex["ref_pixel_values"] for ex in examples]).contiguous().float()
+    input_ids = torch.stack([ex["input_ids"] for ex in examples])
     return {
         "pixel_values": pixel_values,
-        "conditioning_pixel_values": cond_values,  # edge/hint
-        "ref_pixel_values": ref_values,            # ref/semantics
+        "conditioning_pixel_values": cond_values,
+        "ref_pixel_values": ref_values,
         "input_ids": input_ids,
     }
 
@@ -249,23 +240,23 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
     arch = text_encoder_config.architectures[0]
     if arch == "CLIPTextModel":
         from transformers import CLIPTextModel
+
         return CLIPTextModel
     elif arch == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import (
+            RobertaSeriesModelWithTransformation,
+        )
+
         return RobertaSeriesModelWithTransformation
     else:
         raise ValueError(f"{arch} is not supported.")
 
 
 def build_default_configs(latent_size, context_dim=768):
-    """
-    生成 AIA-UNet / ControlNet 的默认结构配置（与 SD1.x 兼容）。
-    你如有自定义 YAML，可以把 target/params 改为自己的配置。
-    """
     unet_config = {
         "target": "edgeloom.models.contourforge.aia_2controlnet.ControlledUnetModel",
         "params": {
-            "image_size": latent_size,          # 通常 512/8 = 64
+            "image_size": latent_size,
             "in_channels": 4,
             "out_channels": 4,
             "model_channels": 320,
@@ -284,7 +275,7 @@ def build_default_configs(latent_size, context_dim=768):
         "image_size": latent_size,
         "in_channels": 4,
         "model_channels": 320,
-        "hint_channels": 3,                 # edge/ref 都按 RGB 读
+        "hint_channels": 3,
         "num_res_blocks": 2,
         "attention_resolutions": [4, 2, 1],
         "channel_mult": [1, 2, 4, 4],
@@ -305,6 +296,40 @@ def build_default_configs(latent_size, context_dim=768):
     return unet_config, control_stage_config, ssl_stage_config
 
 
+# ★ 新增：从 SD1.5 ckpt/safetensors 只提取 U-Net 权重并灌入 AIA-UNet
+def load_sd15_unet_weights_into_aia_unet(aia_unet: torch.nn.Module, ckpt_path: str):
+    """
+    仅提取 'model.diffusion_model.' 权重，strip 前缀后 load_state_dict(strict=False)
+    支持：.ckpt/.pth/.pt（torch.load）与 .safetensors（safetensors.torch.load_file）
+    """
+    if ckpt_path.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file as safe_load
+        except Exception as e:
+            raise RuntimeError("Please `pip install safetensors` to load .safetensors") from e
+        sd = safe_load(ckpt_path)
+    else:
+        sd = torch.load(ckpt_path, map_location="cpu")
+
+    # 兼容含 state_dict 包裹的格式
+    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        sd = sd["state_dict"]
+
+    # 只取扩散 U-Net 权重
+    prefix = "model.diffusion_model."
+    unet_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+    missing, unexpected = aia_unet.load_state_dict(unet_sd, strict=False)
+    logger.info(f"[load sd15->AIA-UNet] missing={len(missing)} unexpected={len(unexpected)}")
+    if len(missing) > 0:
+        # 常见都是 AIA 增加的 zero_conv / 融合层；保持零即可
+        head = "\n  - ".join(missing[:10])
+        logger.info(f"[AIA extra params kept zero-inited] first missing:\n  - {head}")
+    if len(unexpected) > 0:
+        head = "\n  - ".join(unexpected[:10])
+        logger.warning(f"[Unexpected in ckpt (ignored)] first items:\n  - {head}")
+
+
 # --------------------------
 # main
 # --------------------------
@@ -321,15 +346,10 @@ def main(args):
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S", level=logging.INFO,
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
 
     if args.seed is not None:
         set_seed(args.seed)
@@ -338,9 +358,7 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
 
     # --------- Tokenizer / Text Encoder / VAE / Noise Scheduler ----------
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False)
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path)
     text_encoder = text_encoder_cls.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
@@ -350,14 +368,12 @@ def main(args):
     latent_size = args.resolution // 8
     unet_cfg, control_cfg, ssl_cfg = build_default_configs(latent_size, context_dim=768)
 
-
-    # ★ 关键：让 _BaseControl/UNet 内部 self.dtype 与训练精度一致
+    # _BaseControl/UNet 内部 dtype 与训练精度一致
     if accelerator.mixed_precision == "fp16":
         unet_cfg["params"]["use_fp16"] = True
         control_cfg["params"]["use_fp16"] = True
         ssl_cfg["params"]["use_fp16"] = True
     else:
-        # bf16/无混合精度就不要打开 use_fp16（模型里只有这个开关，别误开）
         unet_cfg["params"]["use_fp16"] = False
         control_cfg["params"]["use_fp16"] = False
         ssl_cfg["params"]["use_fp16"] = False
@@ -372,6 +388,11 @@ def main(args):
         learning_rate=args.learning_rate,
     )
 
+    # ★ 载入 SD1.5 U-Net 权重到 AIA-UNet（AIA 额外层保持零）
+    load_sd15_unet_weights_into_aia_unet(model.unet, args.ldm_unet_ckpt)
+    logger.info("Loaded SD1.5 weights into AIA-UNet (AIA extra layers remain zero).")
+
+    # ControlNet 从 U-Net warmstart（与你原来一致）
     def warmstart_control_from_unet(control_module, unet_module):
         cn_sd = control_module.state_dict()
         un_sd = unet_module.state_dict()
@@ -383,21 +404,12 @@ def main(args):
                     cn_sd[k] = un_sd[k]
                     copied += 1
         control_module.load_state_dict(cn_sd, strict=False)
-        print(f"[warmstart] copied {copied} tensors from UNet -> ControlNet")
+        logger.info(f"[warmstart] copied {copied} tensors from UNet -> ControlNet")
 
-
-
-    # （可选）载入 AIA-UNet 预训练权重（建议提供）
-    if args.ldm_unet_ckpt is not None and os.path.isfile(args.ldm_unet_ckpt):
-        sd = torch.load(args.ldm_unet_ckpt, map_location="cpu")
-        missing, unexpected = model.unet.load_state_dict(sd, strict=False)
-        logger.info(f"Loaded AIA-UNet ckpt: missing={len(missing)}, unexpected={len(unexpected)}")
-
-        # 调用
     warmstart_control_from_unet(model.control_model, model.unet)
     warmstart_control_from_unet(model.ssl_stage_model, model.unet)
 
-    # xformers（若你的 AIA-UNet/ControlNet 内部支持，则可启用；否则可以忽略）
+    # xformers / GC（保持你的逻辑）
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             try:
@@ -417,10 +429,11 @@ def main(args):
         except Exception:
             logger.warning("GC not wired in these modules; ignore.")
 
-    # 优化器 & LR
+    # 优化器 & LR（仅训练 Control 参数；U-Net 已被冻结）
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
+
             optimizer_class = bnb.optim.AdamW8bit
         except ImportError:
             raise ImportError("To use 8-bit Adam, install bitsandbytes.")
@@ -429,16 +442,21 @@ def main(args):
 
     params_to_optimize = [p for p in model.parameters() if p.requires_grad]
     optimizer = optimizer_class(
-        params_to_optimize, lr=args.learning_rate,
+        params_to_optimize,
+        lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay, eps=args.adam_epsilon,
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
     )
 
     # 数据
     train_dataset = make_train_dataset(args, tokenizer, accelerator)
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, shuffle=True, collate_fn=collate_fn,
-        batch_size=args.train_batch_size, num_workers=args.dataloader_num_workers,
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
     )
 
     # 调整 LR 计划
@@ -451,18 +469,18 @@ def main(args):
         num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler, optimizer=optimizer,
+        args.lr_scheduler,
+        optimizer=optimizer,
         num_warmup_steps=num_warmup_steps_for_scheduler,
         num_training_steps=num_training_steps_for_scheduler,
-        num_cycles=args.lr_num_cycles, power=args.lr_power,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
     )
 
     # 准备
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-
-
 
     # dtype / 设备
     weight_dtype = torch.float32
@@ -497,7 +515,7 @@ def main(args):
     first_epoch = 0
     initial_global_step = 0
 
-    # 恢复检查点
+    # 恢复
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
@@ -512,10 +530,12 @@ def main(args):
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
-    progress_bar = tqdm(range(0, args.max_train_steps),
-                    initial=initial_global_step,
-                    desc="Steps",
-                    disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        disable=not accelerator.is_local_main_process,
+    )
 
     # -------------------------
     # Training Loop
@@ -524,30 +544,39 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 # VAE encode
-                latents = vae.encode(batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)).latent_dist.sample()
+                latents = (
+                    vae.encode(batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype))
+                    .latent_dist.sample()
+                )
                 latents = latents * vae.config.scaling_factor
 
                 # noise & timestep
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                ).long()
 
-                noisy_latents = noise_scheduler.add_noise(latents.float(), noise.float(), timesteps).to(dtype=weight_dtype)
+                noisy_latents = noise_scheduler.add_noise(latents.float(), noise.float(), timesteps).to(
+                    dtype=weight_dtype
+                )
 
                 # text cond
-                encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device), return_dict=False)[0]
+                encoder_hidden_states = text_encoder(
+                    batch["input_ids"].to(accelerator.device), return_dict=False
+                )[0]
 
                 # two controls
                 cond_edge = batch["conditioning_pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
-                cond_ref  = batch["ref_pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
+                cond_ref = batch["ref_pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
 
                 # forward through AIA system
                 noise_pred = model(
                     noisy_latents=noisy_latents,
                     timesteps=timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    hint=cond_edge,         # 分支1: edge/hint
-                    ssl_hint=cond_ref,      # 分支2: ref/semantics
+                    hint=cond_edge,   # 分支1: edge/hint
+                    ssl_hint=cond_ref # 分支2: ref/semantics
                 )
 
                 # loss target
@@ -558,13 +587,11 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                # SNR 加权 MSE
                 mse = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 mse = mse.mean(dim=list(range(1, mse.ndim)))  # per-sample
-
                 snr = compute_snr(noise_scheduler, timesteps)
-                gamma = 5.0  # 可调 3~7
-                # 对 epsilon 预测的常用配方（简化写法）：
+                gamma = 5.0
                 weights = torch.minimum(snr, torch.full_like(snr, gamma)) / (snr + 1)
                 loss = (weights * mse).mean()
 
@@ -579,7 +606,7 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                # 保存 checkpoint（只存 AIA+Control 模块的权重即可）
+                # checkpoint（与原逻辑一致）
                 if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
                     if args.checkpoints_total_limit is not None:
                         ckpts = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
@@ -590,21 +617,20 @@ def main(args):
                                 shutil.rmtree(os.path.join(args.output_dir, rm))
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
-                    # 另外单独存模块权重，方便后续加载
                     unwrapped = accelerator.unwrap_model(model)
                     torch.save(unwrapped.control_model.state_dict(), os.path.join(save_path, "control_edge.pth"))
                     torch.save(unwrapped.ssl_stage_model.state_dict(), os.path.join(save_path, "control_ref.pth"))
                     torch.save(unwrapped.unet.state_dict(), os.path.join(save_path, "aia_unet.pth"))
                     logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": float(loss.detach().item()), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
         if global_step >= args.max_train_steps:
-                break
+            break
 
     # Final save
     accelerator.wait_for_everyone()

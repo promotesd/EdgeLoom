@@ -28,17 +28,36 @@ import torch.nn.functional as F
 class ControlledUnetModel(UNetModel):
     """
     扩展自 UNetModel。各个 block 内部完成 AIA 融合（接收 control 与 ssl_latent 两路特征）。
-    这里负责把 residual list（从 middle 到最浅）逐层喂给 middle/output blocks。
+    不再在 forward 里使用 no_grad；冻结通过 __init__ 的 requires_grad 来实现，
+    以确保梯度能“穿过” U-Net 回流到 ControlNet。
     """
-    def __init__(self, *args,
-                 freeze_input_blocks: bool = True,
-                 freeze_middle_block: bool = True,
-                 freeze_output_blocks: bool = True,
-                 **kwargs):
+    def __init__(
+        self, *args,
+        freeze_input_blocks: bool = True,
+        freeze_middle_block: bool = True,
+        freeze_output_blocks: bool = True,
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        self._freeze_in = freeze_input_blocks
+        self._freeze_in  = freeze_input_blocks
         self._freeze_mid = freeze_middle_block
         self._freeze_out = freeze_output_blocks
+
+        def _set_requires_grad(module: nn.Module, enabled: bool):
+            for p in module.parameters():
+                p.requires_grad = enabled
+
+        # 冻结/解冻各部分参数（注意：enabled=True 表示参与训练）
+        _set_requires_grad(self.input_blocks,  not self._freeze_in)
+        _set_requires_grad(self.middle_block,  not self._freeze_mid)
+        _set_requires_grad(self.output_blocks, not self._freeze_out)
+
+        # 如果 3 个部分全冻，再把 time_embed 和 out 一并冻住，达到“整张 U-Net 冻住”的效果
+        if self._freeze_in and self._freeze_mid and self._freeze_out:
+            if hasattr(self, "time_embed"):
+                _set_requires_grad(self.time_embed, False)
+            if hasattr(self, "out"):
+                _set_requires_grad(self.out, False)
 
     def forward(
         self,
@@ -51,43 +70,29 @@ class ControlledUnetModel(UNetModel):
     ) -> torch.Tensor:
         assert isinstance(control, list) and isinstance(ssl_latent, list), \
             "control/ssl_latent 必须是 list，并且顺序与 UNet block 对齐（末尾为 middle）。"
+
         hs = []
 
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
-        # 编码侧（常冻结）
-        def encode_path(h):
-            for module in self.input_blocks:
-                h = module(h, emb, context)
-                hs.append(h)
-            return h
-
+        # 编码侧（不再 no_grad；是否更新参数由 requires_grad 决定）
         h = x.type(self.dtype)
-        if self._freeze_in:
-            with torch.no_grad():
-                h = encode_path(h)
-        else:
-            h = encode_path(h)
+        for module in self.input_blocks:
+            h = module(h, emb, context)
+            hs.append(h)
 
         # middle block（AIA 融合）
-        if self._freeze_mid:
-            with torch.no_grad():
-                h = self.middle_block(h, emb, context, control.pop(), ssl_latent.pop())
-        else:
-            h = self.middle_block(h, emb, context, control.pop(), ssl_latent.pop())
+        h = self.middle_block(h, emb, context, control.pop(), ssl_latent.pop())
 
         # 解码侧（逐层 AIA）
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
-            if self._freeze_out:
-                with torch.no_grad():
-                    h = module(h, emb, context, control.pop(), ssl_latent.pop())
-            else:
-                h = module(h, emb, context, control.pop(), ssl_latent.pop())
+            h = module(h, emb, context, control.pop(), ssl_latent.pop())
 
         h = h.type(x.dtype)
         return self.out(h)
+
 
     def set_freeze(self, freeze_input: Optional[bool] = None,
                    freeze_middle: Optional[bool] = None,
