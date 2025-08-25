@@ -5,7 +5,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
 
 import open_clip
-from models.util import default, count_params
+from edgeloom.models.util import default, count_params
 import os
 
 #local_rank = int(os.environ["LOCAL_RANK"])
@@ -95,7 +95,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         "hidden"
     ]
     #def __init__(self, version="/ceph-data/drm/code/FreestyleNet-main/download/openai/clip-vit-large-patch14", device=torch.device(f"cuda:{local_rank}"), max_length=77, freeze=True, layer="last", layer_idx=None):
-    def __init__(self, version="/nfs-data4/drm/NIPS2024-ControlNet-SSL_v1/pretrained_model/openai/clip-vit-large-patch14", device="cuda", max_length=77,freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
+    def __init__(self, version="/root/autodl-tmp/model/clip-vit/clip-vit-large-patch14", device="cuda", max_length=77,freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
         super().__init__()
         assert layer in self.LAYERS
         self.tokenizer = CLIPTokenizer.from_pretrained(version)

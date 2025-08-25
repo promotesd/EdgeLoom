@@ -15,13 +15,14 @@ accelerate launch -m edgeloom.train.train_controlnet \
   --pretrained_model_name_or_path $MODEL_DIR \
   --output_dir $OUTPUT_DIR \
   --dataset_name $JSONL \
+  --config_path "/root/autodl-tmp/code/CIFD_controlnet/EdgeLoom/configs/cldm_ssl_v15_aia_v0.yaml"\
   --image_column target \
   --conditioning_image_column source \
   --caption_column prompt \
   --ref_image_column ref_image \
   --resolution 512 \
   --max_train_steps 96000 \
-  --learning_rate 5e-6 \
+  --learning_rate 1e-5 \
   --train_batch_size 4 \
   --gradient_accumulation_steps 1 \
   --dataloader_num_workers 4  \
